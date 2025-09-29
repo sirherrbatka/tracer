@@ -12,6 +12,7 @@
   :encoding :utf-8
 
   :depends-on (#:alexandria
+               #:iterate
                #:bordeaux-threads)
 
   :pathname "src/"

@@ -2,20 +2,11 @@
 
 (in-package #:tracer)
 
-(defvar *trace-events* nil "A list of trace entries, pushed onto from the beginning.")
-
-(defvar *original-trace-start-breakpoint-fun* #'sb-debug::trace-start-breakpoint-fun "Original SBCL function being overwritten by the tracer.")
-(defvar *original-trace-end-breakpoint-fun* #'sb-debug::trace-end-breakpoint-fun "Original SBCL function being overwritten by the tracer.")
+(defvar *trace-events-lock* (bt2:make-lock))
+(defvar *trace-events* '() "A list of trace entries, pushed onto from the beginning.")
 
 (defvar *clock-reset-fun* nil)
 (defvar *clock-get-time-fun* nil)
-
-
-;;; Timer
-;;; TODO: make it so that user can plug a high-resolution timer here. -- Jacek Złydach, 2019-10-18
-
-(sb-ext:defglobal *hack-clock-jitter* 0 "A crude hack because our clock has too little resolution.")
-(declaim (type fixnum *hack-clock-jitter*))
 
 (unless (>= internal-time-units-per-second 1000)
   (warn "Tracer clock may not havve enough precision to be useful for profiling use."))
@@ -26,25 +17,63 @@
 
 (defun get-current-time-usec ()
   "Get current time with microsecond resolution."
-  (sb-ext:atomic-incf *hack-clock-jitter*)
-  (+ (* (get-internal-real-time) 1000)
-     *hack-clock-jitter*))
+  (* (get-internal-real-time) 1000))
 
-(declaim (ftype (function () alexandria:non-negative-fixnum) get-current-time-usec)
-         (inline get-current-time-usec))
-(defun get-current-time-usec-nojitter ()
-  "Get current time with microsecond resolution. No extra jitter involved."
-  (declare (optimize (speed 3)))
-  (the alexandria:non-negative-fixnum (* (get-internal-real-time) 1000)))
+(declaim (inline %get-current-time))
+(defun %get-current-time ()
+  "Cross-implementation abstraction to get the current time measured from the unix epoch (1/1/1970). Should return (values sec nano-sec)."
+  #+(and allegro (not os-windows))
+  (flet ((allegro-gettimeofday ()
+           (let ((tv (ff:allocate-fobject 'timeval :c)))
+             (allegro-ffi-gettimeofday tv 0)
+             (let ((sec (ff:fslot-value-typed 'timeval :c tv 'tv_sec))
+                   (usec (ff:fslot-value-typed 'timeval :c tv 'tv_usec)))
+               (ff:free-fobject tv)
+               (values sec usec)))))
+    (multiple-value-bind (sec usec) (allegro-gettimeofday)
+      (values sec (* 1000 usec))))
+  #+(and allegro os-windows)
+  (let* ((ft (ff:allocate-fobject 'filetime :c)))
+    (allegro-ffi-get-system-time-as-file-time ft)
+    (let* ((low (ff:fslot-value-typed 'filetime :c ft '|dwLowDateTime|))
+           (high (ff:fslot-value-typed 'filetime :c ft '|dwHighDateTime|)))
+      (filetime-to-current-time low high)))
+  #+cmu
+  (multiple-value-bind (success? sec usec) (unix:unix-gettimeofday)
+    (assert success? () "unix:unix-gettimeofday reported failure?!")
+    (values sec (* 1000 usec)))
+  #+sbcl
+  (sb-ext:get-time-of-day)
+  #+(and ccl (not windows))
+  (ccl:rlet ((tv :timeval))
+    (let ((err (ccl:external-call "gettimeofday" :address tv :address (ccl:%null-ptr) :int)))
+      (assert (zerop err) nil "gettimeofday failed")
+      (values (ccl:pref tv :timeval.tv_sec) (* 1000 (ccl:pref tv :timeval.tv_usec)))))
+  #+(and ccl windows)
+  (ccl:rlet ((time :<lpfiletime>))
+    (ccl:external-call "GetSystemTimeAsFileTime" :<lpfiletime> time :void)
+    (let* ((low (ccl:%get-unsigned-long time (/ 0 8)))
+           (high (ccl:%get-unsigned-long time (/ 32 8))))
+      (filetime-to-current-time low high)))
+  #+abcl
+  (multiple-value-bind (sec millis)
+      (truncate (java:jstatic "currentTimeMillis" "java.lang.System") 1000)
+    (values sec (* millis 1000000)))
+  #+(and lispworks (or linux darwin))
+  (lispworks-gettimeofday)
+  #-(or allegro cmu sbcl abcl ccl (and lispworks (or linux darwin)))
+  (values (- (get-universal-time)
+             ;; CL's get-universal-time uses an epoch of 1/1/1900, so adjust the result to the Unix epoch
+             #.(encode-universal-time 0 0 0 1 1 1970 0))
+          0))
 
 ;;; XXX: below is our new, usec clock -- Jacek Złydach, 2019-11-02
 (let ((clock-offset 0))
   (declare (type alexandria:non-negative-fixnum clock-offset))
   (defun %%start-clock ()
-    (setf clock-offset (sb-kernel::get-time-of-day)))
+    (setf clock-offset (%get-current-time)))
   (defun %%get-time-usec ()
-    (multiple-value-bind (sec usec)
-        (sb-kernel::get-time-of-day)
+    (multiple-value-bind (sec usec) (%get-current-time)
       (+ (* (- sec clock-offset) 1000000) usec)))
   (defun %%time (thunk)
     (let ((start (%%get-time-usec)))
@@ -57,8 +86,6 @@
          (inline get-current-time))
 (defun get-current-time ()
   (funcall *clock-get-time-fun*))
-
-
 
 (defun post-process-entries (entries &key correct-zero-duration)
   "Destructively modify `ENTRIES', making it more compact and, if `CORRECT-ZERO-DURATION' is T,
@@ -107,98 +134,42 @@ and the stacks containing unclosed duration entries, keyed by thread."
             offset
             stacks)))
 
-
 ;;; Tracing process
 
-(defun my-trace-start-breakpoint-fun (info)
-  (let (conditionp)
-    (values
-     (lambda (frame bpt &rest args)
-       (declare (ignore bpt))
-       (sb-debug::discard-invalid-entries frame)
-       (let ((condition (sb-debug::trace-info-condition info))
-             (wherein (sb-debug::trace-info-wherein info)))
-         (setq conditionp
-               (and (not sb-debug::*in-trace*)
-                    (or (not condition)
-                        (apply (cdr condition) frame args))
-                    (or (not wherein)
-                        (sb-debug::trace-wherein-p frame wherein)))))
-       (when conditionp
-         (when (sb-debug::trace-info-encapsulated info)
-           (sb-ext:atomic-push (make-trace-event-fast :enter
-                                                      (sb-debug::trace-info-what info)
-                                                      (bt:current-thread)
-                                                      (get-current-time)
-                                                      args
-                                                      nil
-                                                      nil)
-                               *trace-events*))
-         ;; TODO: perhaps remove this, it seems unneeded -- Jacek Złydach, 2019-11-05
-         (with-standard-io-syntax
-           (apply #'sb-debug::trace-maybe-break info (sb-debug::trace-info-break info) "before"
-                  frame args))))
-     (lambda (frame cookie)
-       (declare (ignore frame))
-       (push (cons cookie conditionp) sb-debug::*traced-entries*)))))
+(defmacro tracing-block ((name args) &body body)
+  (alexandria:once-only (name args)
+    (alexandria:with-gensyms (!current-thread !enter-event !exit-event)
+      `(let* ((,!current-thread (bt2:current-thread))
+              (,!enter-event (cons (make-trace-event-fast :enter
+                                                          ,name
+                                                          ,!current-thread
+                                                          (get-current-time)
+                                                          ,args
+                                                          nil
+                                                          nil)
+                                   nil))
+              (result nil))
+         (unwind-protect (setf result (values-list (progn ,@body)))
+           (let ((,!exit-event (cons (make-trace-event-fast :exit
+                                                            ,name
+                                                            ,!current-thread
+                                                            (get-current-time)
+                                                            result
+                                                            nil
+                                                            nil)
+                                     ,!enter-event)))
+             (bt2:with-lock-held (*trace-events-lock*)
+               (setf (cdr ,!enter-event) *trace-events*
+                     *trace-events* ,!exit-event))))))))
 
-(declaim (ftype (function (sb-debug::trace-info) function) my-trace-end-breakpoint-fun))
-(defun my-trace-end-breakpoint-fun (info)
-  (lambda (frame bpt values cookie)
-    (declare (ignore bpt))
-    (unless (eq cookie (caar sb-debug::*traced-entries*))
-      (setf sb-debug::*traced-entries*
-            (member cookie sb-debug::*traced-entries* :key #'car)))
+(defun wrap-with-tracing (function function-name)
+  (lambda (&rest args)
+    (tracing-block (function-name args)
+      (apply function args))))
 
-    (let ((entry (pop sb-debug::*traced-entries*)))
-      (when (and (not (sb-debug::trace-info-untraced info))
-                 (or (cdr entry)
-                     (let ((cond (sb-debug::trace-info-condition-after info)))
-                       (and cond (apply #'funcall (cdr cond) frame values)))))
-        (sb-ext:atomic-push (make-trace-event-fast :exit
-                                                   (sb-debug::trace-info-what info)
-                                                   (bt:current-thread)
-                                                   (get-current-time)
-                                                   values
-                                                   nil
-                                                   nil)
-                            *trace-events*)
-
-        (apply #'sb-debug::trace-maybe-break info (sb-debug::trace-info-break-after info) "after"
-               frame values)))))
-
-(defun install-tracing-overrides ()
-  (sb-ext:unlock-package (find-package 'sb-debug))
-  (setf (symbol-function 'sb-debug::trace-start-breakpoint-fun) #'my-trace-start-breakpoint-fun
-        (symbol-function 'sb-debug::trace-end-breakpoint-fun) #'my-trace-end-breakpoint-fun)
-  (sb-ext:lock-package (find-package 'sb-debug)))
-
-(defun uninstall-tracing-overrides ()
-  (sb-ext:unlock-package (find-package 'sb-debug))
-  (setf (symbol-function 'sb-debug::trace-start-breakpoint-fun) *original-trace-start-breakpoint-fun*
-        (symbol-function 'sb-debug::trace-end-breakpoint-fun) *original-trace-end-breakpoint-fun*)
-  (sb-ext:lock-package (find-package 'sb-debug)))
-
-;;; FIXME: This should not be a macro. -- Jacek Złydach, 2019-10-18
-(defmacro start-tracing (&rest specs)
-  `(progn
-     (install-tracing-overrides)
-     (trace :encapsulate t :methods t ,@specs)))
-
-(defun stop-tracing ()
-  (untrace)
-  (uninstall-tracing-overrides)
-  #+nil(setf *trace-events* (nreverse *trace-events*))
-  (multiple-value-bind (events offset stacks)
-      (post-process-entries (nreverse *trace-events*))
-    (declare (ignore offset stacks))
-    (setf *trace-events* events))
-  ;; TODO: report offsets and stacks -- Jacek Złydach, 2019-11-05
-  (values))
-
-(defun reset-tracing ()
-  (setf *trace-events* nil
-        *hack-clock-jitter* 0))
 
 (defun get-tracing-report-data ()
   *trace-events*)
+
+(defun reset-tracing-data ()
+  (setf *trace-events* '()))
